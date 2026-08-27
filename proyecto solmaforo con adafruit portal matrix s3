@@ -1,0 +1,366 @@
+//****************************************************************************************************************************************************
+//Proyecto solmaforo con placa matrix portal s3 esp32 adafruit https://es.aliexpress.com/item/1005010231560976.html?osf=ppc_ug&guideModule=ppc_ug&src=google&albch=search&acnt=479-062-3723&isdl=y&aff_short_key=UneMJZVf&albcp=21922783096&albag=171096033576&slnk=&trgt=dsa-42862830006&plac=&crea=780556557801&albad=780556557801&netw=g&device=c&mtctp=&memo1=&albbt=Google_7_search&aff_platform=google&albagn=888888&isSmbActive=false&isSmbAutoCall=false&needSmbHouyi=false&gad_source=1&gad_campaignid=21922783096&gbraid=0AAAAAD2chG4Z4V5C_beO_R4-iQLukz-Ul&gclid=CjwKCAjwhZDUBhBGEiwAbi5bjnjRU-uwrf3XuF52XyQK8SI88y7KjO96bnr3seeJLoq4B6O0YWylfBoCcZEQAvD_BwE
+//Matriz led P10 32X16 SCAN 1/4. https://es.aliexpress.com/item/1005012891805563.html?spm=a2g0o.productlist.main.2.5192lBLBlBLBMi&algo_pvid=643e94c0-bff9-42d3-b3c1-a9d86477ee0a&algo_exp_id=643e94c0-bff9-42d3-b3c1-a9d86477ee0a-1&pdp_ext_f=%7B%22order%22%3A%22-1%22%2C%22eval%22%3A%221%22%2C%22fromPage%22%3A%22search%22%7D&pdp_npi=6%40dis%21CLP%219100%219100%21%21%2165.08%2165.08%21%402103128917870682922434935e0fbe%2112000059639869110%21sea%21CL%212325004665%21X%211%210%21n_tag%3A-29919%3Bd%3Ab7c445c%3Bm03_new_user%3A-29895&curPageLogUid=yDDeRA3lsqOL&utparam-url=scene%3Asearch%7Cquery_from%3A%7Cx_object_id%3A1005012891805563%7C_p_origin_prod%3A
+//*****************************************************************************************************************************************************
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32-VirtualMatrixPanel-I2S-DMA.h>
+#include <time.h>
+#include <sys/time.h>
+#include <WiFiClientSecure.h>
+
+const char* ssid = "XXXXXX";
+const char* password = "XXXXX";
+
+// --- CONFIGURACIÓN DE PANELES HUB75 / MATRIX PORTAL S3 ---d
+class CustomPxBasePanel : public VirtualMatrixPanel
+{
+  public:
+    using VirtualMatrixPanel::VirtualMatrixPanel; 
+  protected:
+    VirtualCoords getCoords(int16_t x, int16_t y);  
+};
+
+inline VirtualCoords CustomPxBasePanel ::getCoords(int16_t x, int16_t y) {
+  coords = VirtualMatrixPanel::getCoords(x, y); 
+  if ( coords.x == -1 || coords.y == -1 ) { return coords; }
+  uint8_t pxbase = 8;  
+  if (panelResY == 16) {
+    if ((coords.y & 4) == 0) {
+      coords.x = ((coords.x / pxbase) + 1) * 2 * pxbase  - (coords.x % pxbase) - 1;
+    } else {
+      coords.x += (coords.x / pxbase) * pxbase;          
+    }
+    coords.y = (coords.y >> 3) * 4 + (coords.y & 0b00000011);
+  }
+  return coords;
+}
+
+#define PANEL_RES_X 32 
+#define PANEL_RES_Y 16 
+#define NUM_ROWS 1 
+#define NUM_COLS 1 
+#define SERPENT true
+#define TOPDOWN false
+#define VIRTUAL_MATRIX_CHAIN_TYPE CHAIN_BOTTOM_RIGHT_UP
+
+MatrixPanel_I2S_DMA *dma_display = nullptr;
+CustomPxBasePanel   *matrix = nullptr; 
+
+// Pines específicos del Matrix Portal S3 para HUB75
+#define R1_PIN 42
+#define G1_PIN 41
+#define B1_PIN 40
+#define R2_PIN 38
+#define G2_PIN 39
+#define B2_PIN 37
+#define A_PIN 45
+#define B_PIN 36
+#define C_PIN 48
+#define D_PIN 35
+#define E_PIN -1 
+#define LAT_PIN 47
+#define OE_PIN 14
+#define CLK_PIN 2
+
+int nivelUV = 0;
+float temperatura = 0.0;
+bool esDeDia = false;
+unsigned long lastUpdate = 0;
+int estado = 0;
+int scrollX = 32;
+unsigned long lastChange = 0;
+
+int sunriseH = 6, sunriseM = 0;
+int sunsetH = 20, sunsetM = 0;
+static bool estadoAnterior = true;
+
+bool actualizarDatos();
+void dibujarRomboRelleno(int nivel);
+void mostrarNivelScroll(int nivel);
+void mostrarTempScroll();
+uint16_t obtenerColor(int nivel);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n--- INICIANDO SISTEMA ---");
+  
+  HUB75_I2S_CFG::i2s_pins _pins={R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
+  HUB75_I2S_CFG mxconfig(
+    PANEL_RES_X * 2,            
+    PANEL_RES_Y / 2,            
+    NUM_ROWS * NUM_COLS         
+    ,_pins            
+  );
+
+  mxconfig.clkphase = true; 
+  mxconfig.driver = HUB75_I2S_CFG::MBI5124;
+
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+  dma_display->setBrightness8(30); 
+
+  if ( not dma_display->begin() )
+    Serial.println("****** !KABOOM! I2S memory allocation failed ***********");
+
+  matrix = new CustomPxBasePanel ((*dma_display), NUM_ROWS, NUM_COLS, PANEL_RES_X, PANEL_RES_Y,  VIRTUAL_MATRIX_CHAIN_TYPE);
+  matrix->setTextWrap(false);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a WiFi");
+  
+  int intentosWiFi = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    intentosWiFi++;
+    if (intentosWiFi > 40) { 
+      Serial.println("\nReintentando conexión WiFi...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      intentosWiFi = 0;
+    }
+  }
+  Serial.println("\nWiFi Conectado!");
+
+  Serial.println("[INICIO] Obteniendo datos iniciales de la API...");
+  bool datosObtenidos = false;
+  
+  while (!datosObtenidos) {
+    if (actualizarDatos()) {
+      datosObtenidos = true;
+      Serial.println("[INICIO] ¡Datos iniciales sincronizados con éxito!");
+    } else {
+      Serial.println("[INICIO] Fallo en la API. Reintentando en 3 segundos...");
+      delay(3000);
+    }
+  }
+
+  lastUpdate = millis(); 
+  lastChange = millis();
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    matrix->fillScreen(0);
+    matrix->setCursor(0, 4);
+    matrix->setTextColor(0xF800);
+    matrix->print("WIFI ERROR");
+    
+    if (WiFi.status() == WL_DISCONNECTED) {
+      WiFi.begin(ssid, password);
+    }
+    delay(1000); 
+    return; 
+  }
+
+  if (millis() - lastUpdate > 600000 || lastUpdate == 0) {
+    actualizarDatos();
+    lastUpdate = millis();
+  }
+
+  time_t now = time(nullptr);
+  struct tm* timeInfo = localtime(&now);
+
+  static int ultimoMinutoImpreso = -1;
+  if (timeInfo->tm_min != ultimoMinutoImpreso) {
+    Serial.println("\n----------------------------------------");
+    Serial.print(" Hora del Sistema (API): ");
+    if(timeInfo->tm_hour < 10) Serial.print("0");
+    Serial.print(timeInfo->tm_hour);
+    Serial.print(":");
+    if(timeInfo->tm_min < 10) Serial.print("0");
+    Serial.println(timeInfo->tm_min);
+
+    Serial.print(" Datos Actuales  -> Temp: ");
+    Serial.print(temperatura);
+    Serial.print(" °C | Nivel UV: ");
+    Serial.print(nivelUV);
+    Serial.print(" | Encendido: ");
+    if(sunriseH < 10) Serial.print("0");
+    Serial.print(sunriseH); Serial.print(":");
+    if(sunriseM < 10) Serial.print("0");
+    Serial.print(sunriseM);
+    Serial.print(" | Apagado: ");
+    if(sunsetH < 10) Serial.print("0");
+    Serial.print(sunsetH); Serial.print(":");
+    if(sunsetM < 10) Serial.print("0");
+    Serial.println(sunsetM);
+    
+    ultimoMinutoImpreso = timeInfo->tm_min;
+  }
+
+  int horaActualMinutos = timeInfo->tm_hour * 60 + timeInfo->tm_min;
+  int inicioMinutos = sunriseH * 60 + sunriseM;
+  int finMinutos = sunsetH * 60 + sunsetM;
+
+  //esDeDia = true;//quita los comentarios de esta linea y comenta la linea siguiente para forzar el encendido de la matriz fuera de horario
+  esDeDia = (horaActualMinutos >= inicioMinutos && horaActualMinutos < finMinutos);
+
+  if (esDeDia) {
+    if (estadoAnterior == false) {
+      Serial.println(">>> MODO ENCENDIDO: Dentro del horario solar.");
+      estadoAnterior = true;
+    }
+
+    matrix->fillScreen(0);
+    
+    // MÁQUINA DE ESTADOS CONTROLADA Y FLUIDA
+    if (estado == 0) {
+      // Estado 0: Muestra el rombo relleno por 3 segundos fijos
+      dibujarRomboRelleno(nivelUV);
+      if (millis() - lastChange > 3000) {
+        estado = 1;          // Pasa a Nivel UV en texto deslizante
+        scrollX = 32;        // Reinicia la posición del texto a la derecha de la matriz
+        lastChange = millis();
+      }
+    } 
+    else if (estado == 1) {
+      // Estado 1: Muestra el texto del nivel UV con scroll hasta salir de la pantalla
+      mostrarNivelScroll(nivelUV);
+      if (scrollX < -35) {   // Cuando termina de cruzar la pantalla de 32px
+        estado = 2;          // Pasa a Temperatura
+        scrollX = 32;        // Reinicia la posición del texto
+        lastChange = millis();
+      }
+    } 
+    else {
+      // Estado 2: Muestra la temperatura con scroll hasta salir de la pantalla
+      mostrarTempScroll();
+      if (scrollX < -50) {   // Cuando termina de cruzar la pantalla
+        estado = 0;          // Vuelve al Rombo inicial
+        scrollX = 32;
+        lastChange = millis();
+      }
+    }
+    
+    delay(80); // Velocidad general del frame rate del ciclo
+  } else {
+    if (estadoAnterior == true) {
+      Serial.println(">>> MODO APAGADO: Fuera de horario solar.");
+      estadoAnterior = false;
+    }
+    matrix->fillScreen(0); 
+    delay(1000);
+  }
+}
+
+bool actualizarDatos() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[API] Consultando Open-Meteo..."); 
+    
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000); 
+    
+    HTTPClient http;
+    
+    if (http.begin(client, "https://api.open-meteo.com/v1/forecast?latitude=-30.08&longitude=-71.25&current=temperature_2m,uv_index&daily=sunrise,sunset&timezone=auto")) {
+      
+      int httpCode = http.GET();
+      
+      if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+          String payload = http.getString();
+          StaticJsonDocument<1536> doc;
+          DeserializationError error = deserializeJson(doc, payload);
+          
+          if (error) {
+            Serial.print("Error al parsear JSON: ");
+            Serial.println(error.c_str());
+            http.end();
+            return false;
+          }
+          
+          temperatura = doc["current"]["temperature_2m"] | 0.0;
+          //temperatura= 20; //comenta la linea anterior y coloca aca el valor de temperatura para probar el funcionamiento del panel
+          float uvFloat = doc["current"]["uv_index"] | 0.0;
+          nivelUV = (int)round(uvFloat);
+          //nivelUV = 11; // comenta la linea anterior y coloca aca el nivel forzado de nivel uv para probar el funcionamiento de la matriz
+
+          const char* currentTimeStr = doc["current"]["time"];
+          if (currentTimeStr) {
+            int anio, mes, dia, h, m;
+            sscanf(currentTimeStr, "%d-%d-%dT%d:%d", &anio, &mes, &dia, &h, &m);
+            
+            struct tm tm_val = {0};
+            tm_val.tm_year = anio - 1900;
+            tm_val.tm_mon  = mes - 1;
+            tm_val.tm_mday = dia;
+            tm_val.tm_hour = h;
+            tm_val.tm_min  = m;
+            tm_val.tm_sec  = 0;
+            
+            time_t t = mktime(&tm_val);
+            struct timeval now = { .tv_sec = t };
+            settimeofday(&now, NULL);
+            
+            Serial.println("[RELOJ] Sincronizado exitosamente con la API.");
+          }
+
+          const char* sr = doc["daily"]["sunrise"][0];
+          const char* ss = doc["daily"]["sunset"][0];
+          
+          if (sr && ss) {
+            sscanf(sr, "%*d-%*d-%*dT%d:%d", &sunriseH, &sunriseM);
+            sscanf(ss, "%*d-%*d-%*dT%d:%d", &sunsetH, &sunsetM);
+          }
+          
+          Serial.println("[API] Datos procesados correctamente:");
+          Serial.print(" -> Temperatura: "); Serial.println(temperatura);
+          Serial.print(" -> Nivel UV (redondeado): "); Serial.println(nivelUV);
+          Serial.print(" -> Amanecer: "); Serial.print(sunriseH); Serial.print(":"); Serial.println(sunriseM);
+          Serial.print(" -> Atardecer: "); Serial.print(sunsetH); Serial.print(":"); Serial.println(sunsetM);
+          
+          http.end();
+          return true;
+        } else {
+          Serial.print("HTTP error code: ");
+          Serial.println(httpCode);
+        }
+      } else {
+        Serial.print("Fallo de conexión HTTPS: ");
+        Serial.println(http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    }
+  }
+  return false;
+}
+
+uint16_t obtenerColor(int nivel) {
+  if (nivel <= 2) return matrix->color565(0, 255, 0);       // Verde
+  if (nivel <= 5) return matrix->color565(0, 255, 255);     // Amarillo
+  if (nivel <= 7) return matrix->color565(0, 120, 255);     // Naranja
+  if (nivel <= 10) return matrix->color565(0, 0, 255);      // Rojo
+  return matrix->color565(255, 0, 128);                     // Morado/Violeta
+}
+
+void dibujarRomboRelleno(int nivel) {
+  uint16_t c = obtenerColor(nivel);
+  int cx = 16, cy = 8, radio = 7;
+  for (int y = cy - radio; y <= cy + radio; y++) {
+    int dx = radio - abs(y - cy);
+    matrix->drawLine(cx - dx, y, cx + dx, y, c);
+  }
+}
+
+void mostrarNivelScroll(int nivel) {
+  matrix->setCursor(scrollX, 4);
+  matrix->setTextColor(obtenerColor(nivel));
+  String niveles[] = {"BAJO", "MEDIO", "ALTO", "MUY ALTO", "EXTREMO"};
+  int idx = (nivel <= 2) ? 0 : (nivel <= 5) ? 1 : (nivel <= 7) ? 2 : (nivel <= 10) ? 3 : 4;
+  matrix->print(niveles[idx]);
+  scrollX--; // Decrementa para mover el texto de derecha a izquierda
+}
+
+void mostrarTempScroll() {
+  matrix->setCursor(scrollX, 4);
+  matrix->setTextColor(matrix->color565(255, 255, 255));
+  matrix->print("TEMP: ");
+  matrix->print((int)temperatura);
+  matrix->print(" C");
+  scrollX--; // Decrementa para mover el texto de derecha a izquierda
+}
